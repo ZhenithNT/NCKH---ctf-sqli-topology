@@ -1,0 +1,104 @@
+- name: Wait for SSH Connection
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Wait for connection
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 300
+
+- name: Setup Vulnerable Environment on Server
+  hosts: server
+  become: true
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - apache2
+          - php
+          - libapache2-mod-php
+          - php-sqlite3
+          - vsftpd
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Configure FTP Anonymous Access
+      copy:
+        dest: /srv/ftp/note.txt
+        content: |
+          [INTERNAL NOTE]
+          Admin Username: admin
+          Remember to lock down login.php!
+          FLAG1: FLAG{ftp_anonymous_access_granted}
+        mode: '0644'
+
+    - name: Enable Anonymous in vsftpd
+      lineinfile:
+        path: /etc/vsftpd.conf
+        regexp: '^anonymous_enable='
+        line: 'anonymous_enable=YES'
+    
+    - name: Restart vsftpd
+      service:
+        name: vsftpd
+        state: restarted
+        enabled: yes
+
+    - name: Deploy Vulnerable Web App
+      copy:
+        dest: /var/www/html/index.php
+        content: |
+          <?php
+          $db = new SQLite3('/var/www/db.sqlite');
+          $db->exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, user TEXT, pass TEXT);");
+          $db->exec("INSERT OR IGNORE INTO users VALUES (1, 'admin', 'SuperSecretPass2026!');");
+
+          if (isset($_POST['username'])) {
+              $u = $_POST['username'];
+              $p = $_POST['password'];
+              // Vulnerable SQL Injection Query
+              $query = "SELECT * FROM users WHERE user = '$u' AND pass = '$p'";
+              $result = $db->query($query);
+              if ($row = $result->fetchArray()) {
+                  echo "<h1>Welcome Admin!</h1>";
+                  echo "<p>FLAG2: FLAG{sqli_auth_bypass_success}</p>";
+                  echo "<p>SSH Credentials -> developer : dev123</p>";
+                  exit;
+              } else {
+                  echo "<p>Invalid credentials</p>";
+              }
+          }
+          ?>
+          <form method="POST">
+            Username: <input type="text" name="username"><br>
+            Password: <input type="password" name="password"><br>
+            <input type="submit" value="Login">
+          </form>
+        mode: '0644'
+
+    - name: Setup User and Vulnerable Cronjob
+      shell: |
+        useradd -m -s /bin/bash developer
+        echo "developer:dev123" | chpasswd
+        echo "FLAG{cronjob_write_permission_root}" > /root/flag.txt
+        chmod 600 /root/flag.txt
+        
+        echo '#!/bin/bash' > /opt/cleanup.sh
+        echo 'rm -rf /tmp/*' >> /opt/cleanup.sh
+        chmod 777 /opt/cleanup.sh
+        
+        echo "* * * * * root /opt/cleanup.sh" > /etc/cron.d/vulnerable_job
+        chmod 0644 /etc/cron.d/vulnerable_job
+
+- name: Setup Client Machine
+  hosts: client
+  become: true
+  tasks:
+    - name: Install Pentest tools
+      apt:
+        name:
+          - nmap
+          - curl
+          - ftp
+        state: present
