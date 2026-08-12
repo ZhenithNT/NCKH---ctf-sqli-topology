@@ -4,31 +4,36 @@ hosts:
   - name: client
     base_box:
       image: ubuntu-focal-x86_64
-      man_user: ubuntu
+      mgmt_user: ubuntu
     flavor: m1.medium
+
   - name: server
     base_box:
       image: ubuntu-focal-x86_64
-      man_user: ubuntu
+      mgmt_user: ubuntu
     flavor: m1.medium
 
 routers:
   - name: router
     base_box:
-      image: debian-11         
-      man_user: debian         
+      image: debian-11
+      mgmt_user: debian
     flavor: m1.small
 
 networks:
   - name: client-net
     cidr: 10.8.10.0/24
+    accessible_by_user: true
+
   - name: server-net
     cidr: 10.8.20.0/24
+    accessible_by_user: false
 
 net_mappings:
   - host: client
     network: client-net
     ip: 10.8.10.5
+
   - host: server
     network: server-net
     ip: 10.8.20.10
@@ -37,11 +42,7 @@ router_mappings:
   - router: router
     network: client-net
     ip: 10.8.10.1
+
   - router: router
     network: server-net
     ip: 10.8.20.1
-
-groups:
-  - name: user-accessible
-    nodes:
-      - client
