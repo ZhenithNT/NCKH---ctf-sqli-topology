@@ -1,104 +1,360 @@
-- name: Wait for SSH Connection
-  hosts: all
-  gather_facts: no
-  tasks:
-    - name: Wait for connection
-      ansible.builtin.wait_for_connection:
-        delay: 5
-        timeout: 300
-
-- name: Setup Vulnerable Environment on Server
+---
+- name: Configure vulnerable server
   hosts: server
   become: true
+  gather_facts: true
+
+  handlers:
+    - name: Restart Apache
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
+
+    - name: Restart vsftpd
+      ansible.builtin.service:
+        name: vsftpd
+        state: restarted
+
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
   tasks:
     - name: Install required packages
-      apt:
+      ansible.builtin.apt:
         name:
           - apache2
           - php
           - libapache2-mod-php
           - php-sqlite3
+          - sqlite3
           - vsftpd
+          - openssh-server
+          - cron
           - curl
         state: present
-        update_cache: yes
+        update_cache: true
+        cache_valid_time: 3600
 
-    - name: Configure FTP Anonymous Access
-      copy:
+    # ---------------------------
+    # FTP anonymous leak
+    # ---------------------------
+    - name: Ensure FTP root exists
+      ansible.builtin.file:
+        path: /srv/ftp
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy leaked FTP note
+      ansible.builtin.copy:
         dest: /srv/ftp/note.txt
+        owner: root
+        group: root
+        mode: "0644"
         content: |
           [INTERNAL NOTE]
-          Admin Username: admin
-          Remember to lock down login.php!
-          FLAG1: FLAG{ftp_anonymous_access_granted}
-        mode: '0644'
+          Web administrator: admin
+          Password deployment is not finished yet.
+          Remember to lock down /login.php!
 
-    - name: Enable Anonymous in vsftpd
-      lineinfile:
+          FLAG1: FLAG{ftp_anonymous_access_granted}
+
+    - name: Enable anonymous FTP login
+      ansible.builtin.lineinfile:
         path: /etc/vsftpd.conf
         regexp: '^anonymous_enable='
         line: 'anonymous_enable=YES'
-    
-    - name: Restart vsftpd
-      service:
-        name: vsftpd
-        state: restarted
-        enabled: yes
+        create: false
+      notify: Restart vsftpd
 
-    - name: Deploy Vulnerable Web App
-      copy:
+    - name: Disable anonymous FTP writes
+      ansible.builtin.lineinfile:
+        path: /etc/vsftpd.conf
+        regexp: '^#?write_enable='
+        line: 'write_enable=NO'
+      notify: Restart vsftpd
+
+    - name: Ensure vsftpd is running
+      ansible.builtin.service:
+        name: vsftpd
+        state: started
+        enabled: true
+
+    # ---------------------------
+    # Vulnerable SQLi web app
+    # ---------------------------
+    - name: Ensure web data directory exists
+      ansible.builtin.file:
+        path: /var/www/data
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0750"
+
+    - name: Initialize SQLite database
+      ansible.builtin.shell: |
+        sqlite3 /var/www/data/db.sqlite <<'SQL'
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY,
+          user TEXT UNIQUE,
+          pass TEXT
+        );
+        INSERT OR IGNORE INTO users(id, user, pass)
+        VALUES (1, 'admin', 'SuperSecretPass2026!');
+        SQL
+        chown www-data:www-data /var/www/data/db.sqlite
+        chmod 0660 /var/www/data/db.sqlite
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Deploy index redirect
+      ansible.builtin.copy:
         dest: /var/www/html/index.php
+        owner: root
+        group: root
+        mode: "0644"
         content: |
           <?php
-          $db = new SQLite3('/var/www/db.sqlite');
-          $db->exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, user TEXT, pass TEXT);");
-          $db->exec("INSERT OR IGNORE INTO users VALUES (1, 'admin', 'SuperSecretPass2026!');");
+          header("Location: /login.php");
+          exit;
+          ?>
 
-          if (isset($_POST['username'])) {
-              $u = $_POST['username'];
-              $p = $_POST['password'];
-              // Vulnerable SQL Injection Query
+    - name: Deploy vulnerable login page
+      ansible.builtin.copy:
+        dest: /var/www/html/login.php
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          <?php
+          session_start();
+
+          $db = new SQLite3('/var/www/data/db.sqlite');
+
+          $error = '';
+
+          if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+              $u = $_POST['username'] ?? '';
+              $p = $_POST['password'] ?? '';
+
+              // Intentionally vulnerable for the training scenario.
               $query = "SELECT * FROM users WHERE user = '$u' AND pass = '$p'";
-              $result = $db->query($query);
-              if ($row = $result->fetchArray()) {
-                  echo "<h1>Welcome Admin!</h1>";
-                  echo "<p>FLAG2: FLAG{sqli_auth_bypass_success}</p>";
-                  echo "<p>SSH Credentials -> developer : dev123</p>";
+
+              $result = @$db->query($query);
+
+              if ($result && $result->fetchArray(SQLITE3_ASSOC)) {
+                  $_SESSION['admin'] = true;
+                  header('Location: /admin.php');
                   exit;
-              } else {
-                  echo "<p>Invalid credentials</p>";
               }
+
+              $error = 'Invalid credentials';
           }
           ?>
-          <form method="POST">
-            Username: <input type="text" name="username"><br>
-            Password: <input type="password" name="password"><br>
-            <input type="submit" value="Login">
-          </form>
-        mode: '0644'
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Internal Portal</title>
+          </head>
+          <body>
+            <h1>Internal Portal Login</h1>
+            <?php if ($error): ?>
+              <p><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></p>
+            <?php endif; ?>
 
-    - name: Setup User and Vulnerable Cronjob
-      shell: |
-        useradd -m -s /bin/bash developer
-        echo "developer:dev123" | chpasswd
-        echo "FLAG{cronjob_write_permission_root}" > /root/flag.txt
-        chmod 600 /root/flag.txt
-        
-        echo '#!/bin/bash' > /opt/cleanup.sh
-        echo 'rm -rf /tmp/*' >> /opt/cleanup.sh
-        chmod 777 /opt/cleanup.sh
-        
-        echo "* * * * * root /opt/cleanup.sh" > /etc/cron.d/vulnerable_job
-        chmod 0644 /etc/cron.d/vulnerable_job
+            <form method="POST" action="/login.php">
+              <label>Username:
+                <input type="text" name="username">
+              </label><br>
+              <label>Password:
+                <input type="password" name="password">
+              </label><br>
+              <input type="submit" value="Login">
+            </form>
+          </body>
+          </html>
 
-- name: Setup Client Machine
+    - name: Deploy admin page
+      ansible.builtin.copy:
+        dest: /var/www/html/admin.php
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          <?php
+          session_start();
+
+          if (empty($_SESSION['admin'])) {
+              http_response_code(403);
+              echo "Forbidden";
+              exit;
+          }
+          ?>
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>Admin Portal</title>
+          </head>
+          <body>
+            <h1>Welcome Admin!</h1>
+            <p>FLAG2: FLAG{sqli_auth_bypass_success}</p>
+            <p>SSH Credentials: developer / dev123</p>
+          </body>
+          </html>
+      notify: Restart Apache
+
+    - name: Disable Apache directory listing
+      ansible.builtin.command: a2dismod autoindex
+      register: autoindex_result
+      changed_when: "'Module autoindex disabled' in autoindex_result.stdout"
+      failed_when: false
+      notify: Restart Apache
+
+    - name: Ensure Apache is running
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
+
+    # ---------------------------
+    # Developer SSH account
+    # ---------------------------
+    - name: Create developer account
+      ansible.builtin.user:
+        name: developer
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Set developer password
+      ansible.builtin.shell: |
+        echo 'developer:dev123' | chpasswd
+      changed_when: false
+
+    - name: Enable SSH password authentication
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/90-training-password-auth.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+      notify: Restart SSH
+
+    - name: Ensure SSH is running
+      ansible.builtin.service:
+        name: ssh
+        state: started
+        enabled: true
+
+    # ---------------------------
+    # Vulnerable cron privilege escalation
+    # ---------------------------
+    - name: Deploy root flag
+      ansible.builtin.copy:
+        dest: /root/flag.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          FLAG{cronjob_write_permission_root}
+
+    - name: Deploy vulnerable cleanup script
+      ansible.builtin.copy:
+        dest: /opt/cleanup.sh
+        owner: root
+        group: root
+        mode: "0777"
+        content: |
+          #!/bin/bash
+          rm -rf /tmp/training-cleanup/* 2>/dev/null || true
+
+    - name: Deploy vulnerable root cron job
+      ansible.builtin.copy:
+        dest: /etc/cron.d/vulnerable_job
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          * * * * * root /opt/cleanup.sh
+
+    - name: Ensure cron is running
+      ansible.builtin.service:
+        name: cron
+        state: started
+        enabled: true
+
+    - name: Flush handlers before validation
+      ansible.builtin.meta: flush_handlers
+
+    # ---------------------------
+    # Provisioning validation
+    # ---------------------------
+    - name: Validate HTTP locally
+      ansible.builtin.uri:
+        url: http://127.0.0.1/login.php
+        status_code: 200
+
+    - name: Validate FTP port locally
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 21
+        timeout: 15
+
+    - name: Validate SSH port locally
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 22
+        timeout: 15
+
+
+- name: Configure attacker client
   hosts: client
   become: true
+  gather_facts: true
+
   tasks:
-    - name: Install Pentest tools
-      apt:
+    - name: Install attacker tools
+      ansible.builtin.apt:
         name:
           - nmap
           - curl
           - ftp
+          - openssh-client
         state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Verify route to server
+      ansible.builtin.command: ip route get 10.8.20.10
+      register: route_to_server
+      changed_when: false
+
+    - name: Show route to server
+      ansible.builtin.debug:
+        var: route_to_server.stdout
+
+    - name: Wait for server SSH from client
+      ansible.builtin.wait_for:
+        host: 10.8.20.10
+        port: 22
+        timeout: 30
+
+    - name: Wait for server HTTP from client
+      ansible.builtin.wait_for:
+        host: 10.8.20.10
+        port: 80
+        timeout: 30
+
+    - name: Wait for server FTP from client
+      ansible.builtin.wait_for:
+        host: 10.8.20.10
+        port: 21
+        timeout: 30
