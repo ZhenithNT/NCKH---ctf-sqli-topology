@@ -209,13 +209,6 @@
           </html>
       notify: Restart Apache
 
-    - name: Disable Apache directory listing
-      ansible.builtin.command: a2dismod autoindex
-      register: autoindex_result
-      changed_when: "'Module autoindex disabled' in autoindex_result.stdout"
-      failed_when: false
-      notify: Restart Apache
-
     - name: Ensure Apache is running
       ansible.builtin.service:
         name: apache2
